@@ -2,14 +2,10 @@ import telebot
 from telebot.types import ReplyKeyboardMarkup
 from datetime import datetime
 import time, json, os, threading
-from flask import Flask, request, jsonify, render_template_string
 
 # ================= CONFIG ================= #
 TOKEN = "8778891878:AAGUsVF7XOs9iTv4hfxnLbpidDHBlv8tVjY"
-WEB_URL = "https://telegram-bot-production-69ca.up.railway.app"
-
 bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
 
 DATA_FILE = "data.json"
 
@@ -24,12 +20,10 @@ def load_data():
     if not os.path.exists(DATA_FILE):
         with open(DATA_FILE, "w") as f:
             json.dump({"users": {}}, f)
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
+    return json.load(open(DATA_FILE))
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    json.dump(data, open(DATA_FILE, "w"), indent=4)
 
 # ================= UI ================= #
 def menu():
@@ -37,19 +31,20 @@ def menu():
     m.row("🟢 Start Work", "⚫ Off Work")
     m.row("🚿 Toilet", "☕ Break", "🍽 Eat")
     m.row("🔙 Back to Seat")
+    m.row("📊 My Stats", "🏆 Leaderboard")
     return m
-
-def format_time(sec):
-    m = int(sec // 60)
-    s = int(sec % 60)
-    return f"{m} min {s} sec" if m else f"{s} sec"
 
 def now():
     return datetime.now().strftime("%m/%d %H:%M:%S")
 
-def checkin_msg(name, user_id, action, hint, details="", result=""):
+def format_time(sec):
+    m = int(sec // 60)
+    s = int(sec % 60)
+    return f"{m}m {s}s" if m else f"{s}s"
+
+def checkin_msg(name, uid, action, hint, details="", result=""):
     return f"""👤 {name}
-User ID: {user_id}
+User ID: {uid}
 ----------
 ✅ Check-In Succeeded: {action} - {now()}
 {details}
@@ -61,36 +56,72 @@ Hint: {hint}
 # ================= AUTO WARNING ================= #
 def auto_warning():
     while True:
-        try:
-            data = load_data()
-            for uid, user in data["users"].items():
-                if user.get("activity") and user.get("start_time"):
-                    used = time.time() - user["start_time"]
-                    limit = LIMITS.get(user["activity"], 0)
+        data = load_data()
+        for uid, user in data["users"].items():
+            if user.get("activity") and user.get("start_time"):
+                used = time.time() - user["start_time"]
+                limit = LIMITS[user["activity"]]
 
-                    if used > limit and not user.get("warned"):
-                        bot.send_message(int(uid), f"⚠️ Limit exceeded: {user['activity']}")
-                        user["warned"] = True
+                try:
+                    if used > limit and not user.get("warn100"):
+                        bot.send_message(int(uid), "🚨 Limit Exceeded!")
+                        user["warn100"] = True
 
-            save_data(data)
-        except:
-            pass
+                    elif used > limit * 0.8 and not user.get("warn80"):
+                        bot.send_message(int(uid), "⚠️ Almost limit reached")
+                        user["warn80"] = True
+                except:
+                    pass
+
+        save_data(data)
         time.sleep(10)
 
 threading.Thread(target=auto_warning, daemon=True).start()
 
+# ================= DAILY REPORT ================= #
+def daily_report():
+    while True:
+        now_time = datetime.now().strftime("%H:%M")
+        if now_time == "23:59":
+            data = load_data()
+            for uid, u in data["users"].items():
+                try:
+                    bot.send_message(int(uid),
+                        f"📊 Daily Report\n⏱ Total: {format_time(u['total'])}\n🔢 Activities: {u['activity_count']}")
+                except:
+                    pass
+            time.sleep(60)
+        time.sleep(30)
+
+threading.Thread(target=daily_report, daemon=True).start()
+
 # ================= BOT ================= #
 @bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(message.chat.id, "Welcome 👇", reply_markup=menu())
+def start(msg):
+    bot.send_message(msg.chat.id, "Welcome 👇", reply_markup=menu())
+
+@bot.message_handler(commands=['history'])
+def history(msg):
+    data = load_data()
+    uid = str(msg.from_user.id)
+    if uid not in data["users"]:
+        bot.send_message(msg.chat.id, "No history")
+        return
+
+    logs = data["users"][uid].get("logs", [])
+    text = "📅 History\n"
+    for l in logs[-10:]:
+        text += f"{l}\n"
+
+    bot.send_message(msg.chat.id, text)
 
 @bot.message_handler(func=lambda m: True)
-def handle(message):
+def handle(m):
     data = load_data()
-    uid = str(message.from_user.id)
-    chat_id = message.chat.id
-    name = message.from_user.first_name
-    text = message.text
+    uid = str(m.from_user.id)
+    name = m.from_user.first_name
+    chat_id = m.chat.id
+    text = m.text
 
     if uid not in data["users"]:
         data["users"][uid] = {
@@ -98,107 +129,83 @@ def handle(message):
             "activity": None,
             "start_time": None,
             "total": 0,
-            "start_count": 0,
             "activity_count": 0,
-            "warned": False
+            "start_count": 0,
+            "logs": []
         }
 
     user = data["users"][uid]
 
-    if text == "🟢 Start Work":
-        if user["working"]:
-            bot.send_message(chat_id, "⚠️ Already working!", reply_markup=menu())
-            return
+    # Anti spam
+    if user.get("last") and time.time() - user["last"] < 1:
+        bot.send_message(chat_id, "⚠️ Slow down bro 😅")
+        return
+    user["last"] = time.time()
 
+    if text == "🟢 Start Work":
         user["working"] = True
         user["start_count"] += 1
+        user["logs"].append(f"🟢 Start - {now()}")
 
         bot.send_message(chat_id,
             checkin_msg(name, uid, "Start Work",
-            "Remember to check in when Off Work arrives.",
-            result="Work Started Successfully"),
-            reply_markup=menu()
-        )
-
-    elif not user["working"]:
-        bot.send_message(chat_id, "⚠️ Please click 'Start Work' first!", reply_markup=menu())
-        return
+            "Stay consistent 💪",
+            result="Work Started"),
+            reply_markup=menu())
 
     elif text in LIMITS:
-        if user["activity"]:
-            bot.send_message(chat_id, f"⚠️ Already in {user['activity']}!", reply_markup=menu())
-            return
-
         user["activity"] = text
         user["start_time"] = time.time()
         user["activity_count"] += 1
-        user["warned"] = False
+        user["logs"].append(f"{text} - {now()}")
+        user["warn80"] = False
+        user["warn100"] = False
 
         bot.send_message(chat_id,
             checkin_msg(name, uid, text,
-            "Remember to click Back to Seat when you return.",
-            details=f"\n⏱ Time Limit: {format_time(LIMITS[text])}\n",
+            "Return fast!",
+            details=f"\n⏱ Limit: {format_time(LIMITS[text])}",
             result=f"{text} Started"),
-            reply_markup=menu()
-        )
+            reply_markup=menu())
 
     elif text == "🔙 Back to Seat":
-        if not user["activity"]:
-            bot.send_message(chat_id, "⚠️ No active task!", reply_markup=menu())
-            return
+        if user["activity"]:
+            used = time.time() - user["start_time"]
+            user["total"] += used
+            act = user["activity"]
 
-        used = time.time() - user["start_time"]
-        user["total"] += used
-        activity = user["activity"]
+            bot.send_message(chat_id,
+                checkin_msg(name, uid, "Back to Seat",
+                "Focus again 💪",
+                details=f"\n📌 {act}\n⏱ Used: {format_time(used)}\n📊 Total: {format_time(user['total'])}",
+                result="Back Successfully"),
+                reply_markup=menu())
 
-        extra = used - LIMITS[activity]
-        warning = f"\n⚠️ Exceeded: {format_time(extra)}" if extra > 0 else ""
-
-        bot.send_message(chat_id,
-            checkin_msg(name, uid, "Back to Seat",
-            "Stay focused! You can do it 💪",
-            details=f"\n📌 Activity: {activity}\n⏱ Used: {format_time(used)}\n📊 Total Today: {format_time(user['total'])}{warning}\n",
-            result="Back to Seat Successfully"),
-            reply_markup=menu()
-        )
-
-        user["activity"] = None
-        user["start_time"] = None
+            user["activity"] = None
 
     elif text == "⚫ Off Work":
-        if not user["working"]:
-            bot.send_message(chat_id, "⚠️ Work not started!", reply_markup=menu())
-            return
-
         user["working"] = False
-        user["activity"] = None
-        user["start_time"] = None
+        user["logs"].append(f"⚫ Off - {now()}")
 
         bot.send_message(chat_id,
             checkin_msg(name, uid, "Off Work",
-            "See you tomorrow! Rest well 😴",
-            details=f"\n📊 Total Time: {format_time(user['total'])}\n🔢 Activities Done: {user['activity_count']}\n",
-            result="Work Finished. Good job 👍"),
-            reply_markup=menu()
-        )
+            "Good rest 😴",
+            details=f"\n📊 Total: {format_time(user['total'])}",
+            result="Finished"),
+            reply_markup=menu())
 
-    else:
-        bot.send_message(chat_id, "❓ Unknown command", reply_markup=menu())
+    elif text == "📊 My Stats":
+        bot.send_message(chat_id,
+            f"📊 Stats\nStart: {user['start_count']}\nActivities: {user['activity_count']}\nTotal: {format_time(user['total'])}",
+            reply_markup=menu())
+
+    elif text == "🏆 Leaderboard":
+        ranking = sorted(data["users"].items(), key=lambda x: x[1]["total"])
+        msg = "🏆 Productivity\n"
+        for i, (u, d) in enumerate(ranking[:5], 1):
+            msg += f"{i}. {u} → {format_time(d['total'])}\n"
+        bot.send_message(chat_id, msg, reply_markup=menu())
 
     save_data(data)
 
-# ================= WEB ================= #
-@app.route("/")
-def home():
-    return "Bot Running ✅"
-
-# ================= RUN ================= #
-def run_bot():
-    bot.polling(none_stop=True)
-
-def run_web():
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
-
-threading.Thread(target=run_bot).start()
-run_web()
+bot.polling()
