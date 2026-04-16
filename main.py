@@ -1,11 +1,11 @@
 import telebot
-from telebot.types import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from telebot.types import ReplyKeyboardMarkup
 from datetime import datetime
 import time, json, os, threading
 from flask import Flask, request, jsonify, render_template_string
 
 # ================= CONFIG ================= #
-TOKEN = "8778891878:AAGUsVF7XOs9iTv4hfxnLbpidDHBlv8tVjY" 
+TOKEN = "8778891878:AAGUsVF7XOs9iTv4hfxnLbpidDHBlv8tVjY"
 WEB_URL = "https://telegram-bot-production-69ca.up.railway.app"
 
 bot = telebot.TeleBot(TOKEN)
@@ -37,13 +37,26 @@ def menu():
     m.row("🟢 Start Work", "⚫ Off Work")
     m.row("🚿 Toilet", "☕ Break", "🍽 Eat")
     m.row("🔙 Back to Seat")
-    m.row("📊 My Stats", "🏆 Leaderboard")
     return m
 
 def format_time(sec):
     m = int(sec // 60)
     s = int(sec % 60)
-    return f"{m}m {s}s" if m else f"{s}s"
+    return f"{m} min {s} sec" if m else f"{s} sec"
+
+def now():
+    return datetime.now().strftime("%m/%d %H:%M:%S")
+
+def checkin_msg(name, user_id, action, hint, details="", result=""):
+    return f"""👤 {name}
+User ID: {user_id}
+----------
+✅ Check-In Succeeded: {action} - {now()}
+{details}
+Hint: {hint}
+
+----------
+✅ {result}"""
 
 # ================= AUTO WARNING ================= #
 def auto_warning():
@@ -56,7 +69,7 @@ def auto_warning():
                     limit = LIMITS.get(user["activity"], 0)
 
                     if used > limit and not user.get("warned"):
-                        bot.send_message(int(uid), f"⚠️ Time exceeded for {user['activity']}")
+                        bot.send_message(int(uid), f"⚠️ Limit exceeded: {user['activity']}")
                         user["warned"] = True
 
             save_data(data)
@@ -69,19 +82,14 @@ threading.Thread(target=auto_warning, daemon=True).start()
 # ================= BOT ================= #
 @bot.message_handler(commands=['start'])
 def start(message):
-    keyboard = InlineKeyboardMarkup()
-    keyboard.add(InlineKeyboardButton(
-        "🚀 Open Dashboard",
-        web_app=WebAppInfo(f"{WEB_URL}/?uid={message.from_user.id}")
-    ))
-
-    bot.send_message(message.chat.id, "Welcome 👇", reply_markup=keyboard)
+    bot.send_message(message.chat.id, "Welcome 👇", reply_markup=menu())
 
 @bot.message_handler(func=lambda m: True)
 def handle(message):
     data = load_data()
     uid = str(message.from_user.id)
     chat_id = message.chat.id
+    name = message.from_user.first_name
     text = message.text
 
     if uid not in data["users"]:
@@ -98,82 +106,91 @@ def handle(message):
     user = data["users"][uid]
 
     if text == "🟢 Start Work":
+        if user["working"]:
+            bot.send_message(chat_id, "⚠️ Already working!", reply_markup=menu())
+            return
+
         user["working"] = True
         user["start_count"] += 1
 
+        bot.send_message(chat_id,
+            checkin_msg(name, uid, "Start Work",
+            "Remember to check in when Off Work arrives.",
+            result="Work Started Successfully"),
+            reply_markup=menu()
+        )
+
+    elif not user["working"]:
+        bot.send_message(chat_id, "⚠️ Please click 'Start Work' first!", reply_markup=menu())
+        return
+
     elif text in LIMITS:
+        if user["activity"]:
+            bot.send_message(chat_id, f"⚠️ Already in {user['activity']}!", reply_markup=menu())
+            return
+
         user["activity"] = text
         user["start_time"] = time.time()
         user["activity_count"] += 1
         user["warned"] = False
 
-    elif text == "🔙 Back to Seat":
-        if user["activity"]:
-            used = time.time() - user["start_time"]
-            user["total"] += used
-            user["activity"] = None
-
-    elif text == "⚫ Off Work":
-        user["working"] = False
-        user["activity"] = None
-
-    elif text == "📊 My Stats":
         bot.send_message(chat_id,
-            f"Start: {user['start_count']}\nActivities: {user['activity_count']}\nTotal: {format_time(user['total'])}",
+            checkin_msg(name, uid, text,
+            "Remember to click Back to Seat when you return.",
+            details=f"\n⏱ Time Limit: {format_time(LIMITS[text])}\n",
+            result=f"{text} Started"),
             reply_markup=menu()
         )
-        return
 
-    elif text == "🏆 Leaderboard":
-        ranking = sorted(data["users"].items(), key=lambda x: x[1]["start_count"], reverse=True)
-        msg = "🏆 Leaderboard\n"
-        for i, (u, d) in enumerate(ranking[:5], 1):
-            msg += f"{i}. {u} → {d['start_count']}x\n"
-        bot.send_message(chat_id, msg, reply_markup=menu())
-        return
+    elif text == "🔙 Back to Seat":
+        if not user["activity"]:
+            bot.send_message(chat_id, "⚠️ No active task!", reply_markup=menu())
+            return
+
+        used = time.time() - user["start_time"]
+        user["total"] += used
+        activity = user["activity"]
+
+        extra = used - LIMITS[activity]
+        warning = f"\n⚠️ Exceeded: {format_time(extra)}" if extra > 0 else ""
+
+        bot.send_message(chat_id,
+            checkin_msg(name, uid, "Back to Seat",
+            "Stay focused! You can do it 💪",
+            details=f"\n📌 Activity: {activity}\n⏱ Used: {format_time(used)}\n📊 Total Today: {format_time(user['total'])}{warning}\n",
+            result="Back to Seat Successfully"),
+            reply_markup=menu()
+        )
+
+        user["activity"] = None
+        user["start_time"] = None
+
+    elif text == "⚫ Off Work":
+        if not user["working"]:
+            bot.send_message(chat_id, "⚠️ Work not started!", reply_markup=menu())
+            return
+
+        user["working"] = False
+        user["activity"] = None
+        user["start_time"] = None
+
+        bot.send_message(chat_id,
+            checkin_msg(name, uid, "Off Work",
+            "See you tomorrow! Rest well 😴",
+            details=f"\n📊 Total Time: {format_time(user['total'])}\n🔢 Activities Done: {user['activity_count']}\n",
+            result="Work Finished. Good job 👍"),
+            reply_markup=menu()
+        )
+
+    else:
+        bot.send_message(chat_id, "❓ Unknown command", reply_markup=menu())
 
     save_data(data)
-    bot.send_message(chat_id, "✅ Updated", reply_markup=menu())
 
 # ================= WEB ================= #
-HTML = """
-<h2 style="text-align:center;">🚀 Dashboard</h2>
-<button onclick="send('start')">Start</button>
-<button onclick="send('off')">Off</button>
-<script>
-const uid = new URLSearchParams(window.location.search).get("uid");
-function send(a){
-fetch('/api',{method:'POST',headers:{'Content-Type':'application/json'},
-body:JSON.stringify({uid:uid,action:a})})
-.then(r=>r.json()).then(d=>alert(d.msg))
-}
-</script>
-"""
-
 @app.route("/")
 def home():
-    return render_template_string(HTML)
-
-@app.route("/api", methods=["POST"])
-def api():
-    data = load_data()
-    req = request.json
-    uid = str(req["uid"])
-    action = req["action"]
-
-    if uid not in data["users"]:
-        data["users"][uid] = {"working": False, "start_count": 0}
-
-    user = data["users"][uid]
-
-    if action == "start":
-        user["working"] = True
-        user["start_count"] += 1
-    elif action == "off":
-        user["working"] = False
-
-    save_data(data)
-    return jsonify({"msg": "✅ Done"})
+    return "Bot Running ✅"
 
 # ================= RUN ================= #
 def run_bot():
